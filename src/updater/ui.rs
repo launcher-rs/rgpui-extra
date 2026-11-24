@@ -99,6 +99,150 @@ pub struct UpdateDialogContent {
     pub notes_max_height: f32,
 }
 
+/// 把一行文本按行内代码反引号切分渲染：无反引号时保持单个 div（长文本可自然换行），
+/// 有反引号时用 h_flex 把代码段与周围文本水平混排。
+fn render_inline_parts(line: &str, theme: &Theme) -> AnyElement {
+    if !line.contains('`') {
+        return div().child(line.to_string()).into_any_element();
+    }
+    let mut parts: Vec<AnyElement> = Vec::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find('`') {
+        let (plain, tail) = rest.split_at(pos);
+        if !plain.is_empty() {
+            parts.push(div().child(plain.to_string()).into_any_element());
+        }
+        let after = &tail[1..];
+        if let Some(end) = after.find('`') {
+            let (code, remaining) = after.split_at(end);
+            parts.push(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(12.0))
+                    .text_color(theme.accent_foreground)
+                    .child(code.to_string())
+                    .into_any_element(),
+            );
+            rest = &remaining[1..];
+        } else {
+            parts.push(div().child(after.to_string()).into_any_element());
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        parts.push(div().child(rest.to_string()).into_any_element());
+    }
+    h_flex().flex_wrap().children(parts).into_any_element()
+}
+
+/// 一行 Markdown 的分类结果，便于无渲染上下文地单测解析逻辑。
+#[derive(Debug, PartialEq, Eq)]
+enum NotesLine<'a> {
+    /// 围栏代码块开关（``` 所在行本身不显示）。
+    Fence,
+    Blank,
+    Heading(u8, &'a str),
+    ListItem(&'a str),
+    Paragraph(&'a str),
+}
+
+/// 对单行做分类（不处理代码块开合状态，由调用方维护）。
+fn classify_notes_line(line: &str) -> NotesLine<'_> {
+    if line.trim_start().starts_with("```") {
+        return NotesLine::Fence;
+    }
+    if line.trim().is_empty() {
+        return NotesLine::Blank;
+    }
+    if let Some(rest) = line.strip_prefix("### ") {
+        return NotesLine::Heading(3, rest);
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return NotesLine::Heading(2, rest);
+    }
+    if let Some(rest) = line.strip_prefix("# ") {
+        return NotesLine::Heading(1, rest);
+    }
+    if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return NotesLine::ListItem(item);
+    }
+    NotesLine::Paragraph(line)
+}
+
+/// 把一段轻量 Markdown（GitHub release notes 的常见语法）渲染为 rgpui 元素列表。
+///
+/// 支持 `#`/`##`/`###` 标题、`-`/`*` 列表、行内代码 `` `code` ``、
+/// 围栏代码块与段落/空行间距；不追求完整 CommonMark，只覆盖发布说明常用写法。
+fn render_notes_markdown(text: &str, theme: &Theme) -> Vec<AnyElement> {
+    let foreground = theme.foreground;
+    let mut elements: Vec<AnyElement> = Vec::new();
+    let mut in_code_block = false;
+
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            elements.push(
+                div()
+                    .w_full()
+                    .font_family("monospace")
+                    .text_size(px(12.0))
+                    .text_color(foreground)
+                    .child(line.to_string())
+                    .into_any_element(),
+            );
+            continue;
+        }
+
+        match classify_notes_line(line) {
+            NotesLine::Blank => {
+                elements.push(div().h(px(6.0)).w_full().into_any_element());
+            }
+            NotesLine::Fence => {}
+            NotesLine::Heading(level, body) => {
+                elements.push(
+                    div()
+                        .w_full()
+                        .mt(px(8.0))
+                        .mb(px(2.0))
+                        .font_semibold()
+                        .text_size(px(if level == 1 { 16.0 } else { 14.0 }))
+                        .text_color(foreground)
+                        .child(render_inline_parts(body, theme))
+                        .into_any_element(),
+                );
+            }
+            NotesLine::ListItem(item) => {
+                elements.push(
+                    div()
+                        .w_full()
+                        .pl(px(14.0))
+                        .text_size(px(13.0))
+                        .text_color(foreground)
+                        .child(render_inline_parts(&format!("• {item}"), theme))
+                        .into_any_element(),
+                );
+            }
+            NotesLine::Paragraph(text) => {
+                elements.push(
+                    div()
+                        .w_full()
+                        .text_size(px(13.0))
+                        .text_color(foreground)
+                        .child(render_inline_parts(text, theme))
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+
+    elements
+}
+
 /// 渲染「发现新版本」对话框。说明区限制最大高度并支持滚动。
 ///
 /// 返回的是可直接挂到编辑器渲染树上的覆盖层元素；`on_choice` 是按钮回调，
@@ -163,16 +307,27 @@ pub fn render_update_dialog<V: 'static>(
                                 .text_color(theme.muted_foreground)
                                 .child(strings.notes_label.clone()),
                         )
-                        // 关键：限制更新说明高度，内容多时滚动而不是撑满屏幕。
+                        // 关键：Dialog 的 content 位于 auto-height 的 flex 列中，
+                        // 直接对滚动容器用 max_h 会因父级高度不确定而失效（内容把
+                        // 对话框整个撑高、不出现滚动条）。改为让滚动区占满一个外部
+                        // 承担高度约束的 wrapper：wrapper 用 max_h + min_h(0) 在 flex
+                        // 列里确立高度上限，内层 size_full + overflow_y_scrollbar 才会
+                        // 拿到确定高度并真正出现滚动条。
                         .child(
                             div()
                                 .w_full()
                                 .max_h(px(notes_max_height))
-                                .overflow_y_scrollbar()
-                                .p(px(10.0))
-                                .rounded_md()
-                                .bg(theme.input_background())
-                                .child(notes.clone()),
+                                .min_h(px(0.0))
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .overflow_y_scrollbar()
+                                        .p(px(10.0))
+                                        .rounded_md()
+                                        .bg(theme.input_background())
+                                        .children(render_notes_markdown(&notes, &theme)),
+                                ),
                         ),
                 )
         })
@@ -225,7 +380,7 @@ pub fn render_update_dialog<V: 'static>(
 #[cfg(test)]
 mod tests {
     // 不能用 `use super::*`：父模块的 `use rgpui::*` 会带来同名 `test` 宏导致递归展开。
-    use super::{DownloadProgress, UpdateStatus};
+    use super::{DownloadProgress, NotesLine, UpdateStatus, classify_notes_line};
 
     #[test]
     fn status_label_reports_phase_and_percentage() {
@@ -249,5 +404,32 @@ mod tests {
         let status = UpdateStatus::default();
         assert_eq!(status.label("checking", "downloading"), None);
         assert_eq!(status.fraction(), None);
+    }
+
+    #[test]
+    fn classifies_release_note_lines() {
+        assert_eq!(
+            classify_notes_line("### 修复"),
+            NotesLine::Heading(3, "修复")
+        );
+        assert_eq!(
+            classify_notes_line("## 变更"),
+            NotesLine::Heading(2, "变更")
+        );
+        assert_eq!(classify_notes_line("# 标题"), NotesLine::Heading(1, "标题"));
+        assert_eq!(
+            classify_notes_line("- 列表项"),
+            NotesLine::ListItem("列表项")
+        );
+        assert_eq!(
+            classify_notes_line("* 星号列表"),
+            NotesLine::ListItem("星号列表")
+        );
+        assert_eq!(classify_notes_line("```"), NotesLine::Fence);
+        assert_eq!(classify_notes_line("  "), NotesLine::Blank);
+        assert_eq!(
+            classify_notes_line("普通段落"),
+            NotesLine::Paragraph("普通段落")
+        );
     }
 }
