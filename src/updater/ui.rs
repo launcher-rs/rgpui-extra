@@ -307,27 +307,20 @@ pub fn render_update_dialog<V: 'static>(
                                 .text_color(theme.muted_foreground)
                                 .child(strings.notes_label.clone()),
                         )
-                        // 关键：Dialog 的 content 位于 auto-height 的 flex 列中，
-                        // 直接对滚动容器用 max_h 会因父级高度不确定而失效（内容把
-                        // 对话框整个撑高、不出现滚动条）。改为让滚动区占满一个外部
-                        // 承担高度约束的 wrapper：wrapper 用 max_h + min_h(0) 在 flex
-                        // 列里确立高度上限，内层 size_full + overflow_y_scrollbar 才会
-                        // 拿到确定高度并真正出现滚动条。
+                        // 关键：Scrollable（overflow_y_scrollbar）的 root 用 size_full()
+                        // 取父容器高度，只有父级高度「确定」时才能算出滚动范围。Dialog
+                        // 的 content 处于 auto-height 的 flex 列里，原先的 max_h 会因父
+                        // 高度不确定而失效，内容把对话框整个撑高、不出现滚动条。这里给
+                        // 滚动区一个明确高度，滚动范围即可正确计算并出现滚动条。
                         .child(
                             div()
                                 .w_full()
-                                .max_h(px(notes_max_height))
-                                .min_h(px(0.0))
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .size_full()
-                                        .overflow_y_scrollbar()
-                                        .p(px(10.0))
-                                        .rounded_md()
-                                        .bg(theme.input_background())
-                                        .children(render_notes_markdown(&notes, &theme)),
-                                ),
+                                .h(px(notes_max_height))
+                                .overflow_y_scrollbar()
+                                .p(px(10.0))
+                                .rounded_md()
+                                .bg(theme.input_background())
+                                .children(render_notes_markdown(&notes, &theme)),
                         ),
                 )
         })
