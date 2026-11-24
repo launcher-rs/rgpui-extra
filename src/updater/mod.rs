@@ -471,6 +471,7 @@ pub fn open_release_page(config: &Config) -> Result<()> {
 
 /// 单文件程序的替换 + 重启 helper（不依赖 GUI，随 `updater` feature 提供）。
 pub mod install;
+pub use install::{InstallOptions, spawn_install_helper};
 
 #[cfg(feature = "ui")]
 pub mod ui;
