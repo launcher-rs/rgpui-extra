@@ -36,6 +36,9 @@ pub enum UpdatePhase {
     Idle,
     Checking,
     Downloading,
+    /// 下载已完成、等待用户确认安装。用于避免状态栏停留在「正在下载」
+    /// 与「下载成功」弹窗同时出现的矛盾。
+    Downloaded,
 }
 
 /// 状态栏进度模型：纯数据，由使用方存进自己的实体并在进度回调里 `cx.notify()`。
@@ -60,19 +63,38 @@ impl UpdateStatus {
         }
     }
 
+    /// 下载完成：进度条显示满格，状态栏显示「下载完成」文案。
+    pub fn downloaded() -> Self {
+        Self {
+            phase: UpdatePhase::Downloaded,
+            progress: Some(DownloadProgress {
+                downloaded: 1,
+                total: Some(1),
+            }),
+        }
+    }
+
     /// 进度条用的 0.0..=1.0 值；未知或空闲时为 `None`。
     pub fn fraction(&self) -> Option<f32> {
         match self.phase {
             UpdatePhase::Downloading => self.progress.and_then(|p| p.fraction()),
+            UpdatePhase::Downloaded => Some(1.0),
             _ => None,
         }
     }
 
-    /// 状态栏文本：检查中显示固定文案，下载中附加百分比与字节数。
-    pub fn label(&self, checking_label: &str, downloading_label: &str) -> Option<String> {
+    /// 状态栏文本：检查中显示固定文案，下载中附加百分比与字节数，
+    /// 下载完成显示固定文案（不再拼进度）。
+    pub fn label(
+        &self,
+        checking_label: &str,
+        downloading_label: &str,
+        downloaded_label: &str,
+    ) -> Option<String> {
         match self.phase {
             UpdatePhase::Idle => None,
             UpdatePhase::Checking => Some(checking_label.to_string()),
+            UpdatePhase::Downloaded => Some(downloaded_label.to_string()),
             UpdatePhase::Downloading => {
                 let mut label = downloading_label.to_string();
                 if let Some(progress) = self.progress {
@@ -375,11 +397,13 @@ mod tests {
     // 不能用 `use super::*`：父模块的 `use rgpui::*` 会带来同名 `test` 宏导致递归展开。
     use super::{DownloadProgress, NotesLine, UpdateStatus, classify_notes_line};
 
+    const LABELS: (&str, &str, &str) = ("checking", "downloading", "downloaded");
+
     #[test]
     fn status_label_reports_phase_and_percentage() {
         let mut status = UpdateStatus::checking();
         assert_eq!(
-            status.label("checking", "downloading").as_deref(),
+            status.label(LABELS.0, LABELS.1, LABELS.2).as_deref(),
             Some("checking")
         );
         status = UpdateStatus::downloading();
@@ -387,15 +411,26 @@ mod tests {
             downloaded: 1,
             total: Some(4),
         });
-        let label = status.label("checking", "downloading").unwrap();
+        let label = status.label(LABELS.0, LABELS.1, LABELS.2).unwrap();
         assert!(label.starts_with("downloading 25%"), "got {label:?}");
         assert_eq!(status.fraction(), Some(0.25));
     }
 
     #[test]
+    fn downloaded_status_shows_complete_instead_of_progress() {
+        let status = UpdateStatus::downloaded();
+        // 完成态不拼百分比/字节，也不再显示"正在下载"。
+        assert_eq!(
+            status.label(LABELS.0, LABELS.1, LABELS.2).as_deref(),
+            Some("downloaded")
+        );
+        assert_eq!(status.fraction(), Some(1.0));
+    }
+
+    #[test]
     fn idle_status_has_no_label() {
         let status = UpdateStatus::default();
-        assert_eq!(status.label("checking", "downloading"), None);
+        assert_eq!(status.label(LABELS.0, LABELS.1, LABELS.2), None);
         assert_eq!(status.fraction(), None);
     }
 
