@@ -3,8 +3,10 @@
 //! 这是 `rgpui-extra` 扩展库的 `updater` 模块；启用 `updater` feature 即可使用。
 //!
 //! 职责边界：
-//! - 只做「版本比较 → GitHub Release 查询 → 镜像回退 → 分块下载 → 解压出单文件 →
-//!   落地为 `<exe>.new`」，不自动检查、不替换正在运行的程序、不自动重启；
+//! - 提供「版本比较 → GitHub Release 查询 → 镜像回退 → 分块下载 → 解压出单文件 →
+//!   落地为 `<exe>.new` → 替换旧程序并重启」的完整能力，但不主动发起检查；
+//! - 替换由 [`install`] 模块的独立 helper 在调用方进程退出后完成（Windows 上
+//!   运行中的 exe 无法自我覆盖），调用方负责决定何时触发与退出时机；
 //! - 所有网络函数是 blocking，调用方必须放到后台线程（可用 [`run_blocking`] 桥接 async）；
 //! - 网络层不认识具体程序，仓库、应用名、资产名全部由 [`Config`] 注入，
 //!   因此 launcher-rs 的其他程序可直接复用；
@@ -466,6 +468,9 @@ pub fn open_release_page(config: &Config) -> Result<()> {
     let _ = url;
     Ok(())
 }
+
+/// 单文件程序的替换 + 重启 helper（不依赖 GUI，随 `updater` feature 提供）。
+pub mod install;
 
 #[cfg(feature = "ui")]
 pub mod ui;
