@@ -1,0 +1,37 @@
+[package]
+name = "rgpui-extra"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "rgpui 生态的官方扩展库：当前提供 GitHub Release 更新组件（可选 feature，默认不回流）"
+repository = "https://github.com/launcher-rs/rgpui-extra"
+documentation = "https://docs.rs/rgpui-extra"
+keywords = ["rgpui", "updater", "components", "github"]
+categories = ["gui", "network-programming"]
+
+[features]
+# 默认不启用任何组件，使用方按需显式开启。
+default = []
+updater = [
+    "dep:anyhow",
+    "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:reqwest",
+    "dep:zip",
+    "dep:flate2",
+    "dep:tar",
+]
+# rgpui 对话框与状态栏进度模型，依赖 updater 核心。
+ui = ["updater", "dep:rgpui"]
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "default-tls"], optional = true }
+zip = { version = "2", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+rgpui = { version = "1.8.3", optional = true }
