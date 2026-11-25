@@ -45,46 +45,71 @@ pub fn validate_staged(options: &InstallOptions) -> Result<()> {
     Ok(())
 }
 
-/// 生成 Windows 平台的 `.cmd` helper 内容（纯函数，便于单测）。
+/// 生成 Windows 平台的 PowerShell helper 内容。
 ///
-/// helper 启动后循环等待 PID 退出，成功后用 `move /Y` 覆盖 exe 并重启；
-/// 超时或替换失败就退出，绝不留下半替换的状态。
+/// 脚本以 UTF-16LE BOM 保存，避免 Windows 批处理代码页损坏可执行文件或文档中的中文路径。
 pub fn build_windows_script(options: &InstallOptions) -> String {
-    let exe = windows_quote(&options.current_exe.to_string_lossy());
-    let staged = windows_quote(&options.staged_exe.to_string_lossy());
-    let args = join_windows_args(&options.restart_args);
+    let exe = powershell_quote(&options.current_exe.to_string_lossy());
+    let staged = powershell_quote(&options.staged_exe.to_string_lossy());
+    let args = options
+        .restart_args
+        .iter()
+        .map(|arg| format!("    {},", powershell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join("\r\n");
     format!(
-        "@echo off\r\n\
-setlocal\r\n\
-set \"PID={pid}\"\r\n\
-set \"EXE={exe}\"\r\n\
-set \"NEW={staged}\"\r\n\
-set /a TRIES=0\r\n\
-\r\n\
-:wait\r\n\
-tasklist /FI \"PID eq %PID%\" 2>NUL | findstr /I /C:\"%PID%\" >NUL\r\n\
-if errorlevel 1 goto replace\r\n\
-set /a TRIES+=1\r\n\
-if %TRIES% GEQ {timeout} goto failed\r\n\
-ping -n 2 127.0.0.1 >NUL\r\n\
-goto wait\r\n\
-\r\n\
-:replace\r\n\
-move /Y \"%NEW%\" \"%EXE%\" >NUL\r\n\
-if errorlevel 1 goto failed\r\n\
-start \"\" \"%EXE%\"{args}\r\n\
-endlocal\r\n\
-exit /b 0\r\n\
-\r\n\
-:failed\r\n\
-endlocal\r\n\
-exit /b 1\r\n",
+        "$ErrorActionPreference = 'Stop'\r\n\
+$targetPid = {pid}\r\n\
+$exe = {exe}\r\n\
+$staged = {staged}\r\n\
+$restartArgs = @(\r\n\
+{args}\r\n\
+)\r\n\
+$deadline = [DateTime]::UtcNow.AddSeconds({timeout})\r\n\
+while (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {{\r\n\
+    if ([DateTime]::UtcNow -ge $deadline) {{ exit 1 }}\r\n\
+    Start-Sleep -Milliseconds 500\r\n\
+}}\r\n\
+try {{ Move-Item -LiteralPath $staged -Destination $exe -Force -ErrorAction Stop }}\r\n\
+catch {{ exit 1 }}\r\n\
+function ConvertTo-WindowsCommandLineArgument([string]$value) {{\r\n\
+    $builder = New-Object System.Text.StringBuilder\r\n\
+    [void]$builder.Append([char]34)\r\n\
+    $slashes = 0\r\n\
+    foreach ($character in $value.ToCharArray()) {{\r\n\
+        if ([int]$character -eq 92) {{ $slashes++; continue }}\r\n\
+        if ([int]$character -eq 34) {{\r\n\
+            for ($i = 0; $i -lt (2 * $slashes + 1); $i++) {{ [void]$builder.Append([char]92) }}\r\n\
+            [void]$builder.Append([char]34)\r\n\
+        }} else {{\r\n\
+            for ($i = 0; $i -lt $slashes; $i++) {{ [void]$builder.Append([char]92) }}\r\n\
+            [void]$builder.Append($character)\r\n\
+        }}\r\n\
+        $slashes = 0\r\n\
+    }}\r\n\
+    for ($i = 0; $i -lt (2 * $slashes); $i++) {{ [void]$builder.Append([char]92) }}\r\n\
+    [void]$builder.Append([char]34)\r\n\
+    return $builder.ToString()\r\n\
+}}\r\n\
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo\r\n\
+$startInfo.FileName = $exe\r\n\
+$startInfo.WorkingDirectory = (Get-Location).Path\r\n\
+$startInfo.Arguments = (($restartArgs | ForEach-Object {{ ConvertTo-WindowsCommandLineArgument $_ }}) -join ' ')\r\n\
+$startInfo.UseShellExecute = $false\r\n\
+try {{ [System.Diagnostics.Process]::Start($startInfo) | Out-Null }}\r\n\
+catch {{ exit 1 }}\r\n\
+exit 0\r\n",
         pid = options.process_id,
-        timeout = WAIT_TIMEOUT_SECS / 2, // ping 约 0.5s/次
+        timeout = WAIT_TIMEOUT_SECS,
         exe = exe,
         staged = staged,
         args = args,
     )
+}
+
+/// PowerShell 单引号字符串转义。
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// 生成 Unix 平台的 `.sh` helper 内容（纯函数，便于单测）。
@@ -121,7 +146,7 @@ exit 0\n",
 pub fn build_script(options: &InstallOptions) -> (String, &'static str) {
     #[cfg(target_os = "windows")]
     {
-        (build_windows_script(options), "cmd")
+        (build_windows_script(options), "ps1")
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -145,20 +170,39 @@ pub fn spawn_install_helper(options: &InstallOptions) -> Result<PathBuf> {
         "rgpui-updater-{}-{nonce}.{extension}",
         options.process_id
     ));
-    std::fs::write(&path, &script_text)
-        .with_context(|| format!("写入更新 helper 失败：{}", path.display()))?;
-
     #[cfg(target_os = "windows")]
     {
-        // `start "" /B` 让 cmd 在后台运行且不弹窗；空的第一个参数是必需的
-        // 窗口标题占位，否则 `cmd` 会被当成标题而不被执行。传空串时 Rust 会
-        // 把它编码成 `""`，正是 cmd 需要的空标题。
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", "/B", "cmd", "/C"])
+        use std::os::windows::process::CommandExt as _;
+
+        // Windows PowerShell 5.1 读取带 BOM 的 UTF-16LE 脚本，可无损处理中文路径。
+        let mut script_bytes = vec![0xFF, 0xFE];
+        for code_unit in script_text.encode_utf16() {
+            script_bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        std::fs::write(&path, script_bytes)
+            .with_context(|| format!("写入更新 helper 失败：{}", path.display()))?;
+
+        // PowerShell 在隐藏窗口中独立等待主程序退出，再替换并重启。
+        std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
             .arg(&path)
+            .creation_flags(0x08000000)
             .spawn()
             .with_context(|| "启动更新 helper 失败")?;
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::write(&path, &script_text)
+            .with_context(|| format!("写入更新 helper 失败：{}", path.display()))?;
+    }
+
     #[cfg(not(target_os = "windows"))]
     {
         use std::os::unix::process::CommandExt;
@@ -168,30 +212,6 @@ pub fn spawn_install_helper(options: &InstallOptions) -> Result<PathBuf> {
     }
 
     Ok(path)
-}
-
-/// Windows `set "VAR=value"` 语境下的转义：百分号须双写，避免被当成变量展开。
-fn windows_quote(value: &str) -> String {
-    value.replace('%', "%%")
-}
-
-/// Windows 命令行参数拼接；空参数直接省略。
-fn join_windows_args(args: &[String]) -> String {
-    if args.is_empty() {
-        return String::new();
-    }
-    let joined: Vec<String> = args
-        .iter()
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| {
-            if arg.contains(' ') || arg.contains('"') {
-                format!(" \"{}\"", arg.replace('"', "\"\""))
-            } else {
-                format!(" {arg}")
-            }
-        })
-        .collect();
-    joined.join("")
 }
 
 /// POSIX shell 单引号转义。
@@ -233,15 +253,15 @@ mod tests {
     #[test]
     fn windows_script_waits_then_replaces_and_restarts() {
         let script = build_windows_script(&options());
-        assert!(script.contains("PID eq %PID%"));
-        assert!(script.contains("move /Y \"%NEW%\" \"%EXE%\""));
-        assert!(script.contains("start \"\" \"%EXE%\""));
+        assert!(script.contains("Get-Process -Id $targetPid"));
+        assert!(script.contains("Move-Item -LiteralPath $staged -Destination $exe"));
+        assert!(script.contains("$startInfo.FileName = $exe"));
         assert!(script.contains("note.md"));
-        assert!(script.contains("\"my docs/today.md\""));
-        assert!(script.contains(&format!("GEQ {}", WAIT_TIMEOUT_SECS / 2)));
+        assert!(script.contains("'my docs/today.md'"));
+        assert!(script.contains(&format!("AddSeconds({WAIT_TIMEOUT_SECS})")));
         // helper 必须区分成功与失败退出码。
-        assert!(script.contains("exit /b 0"));
-        assert!(script.contains("exit /b 1"));
+        assert!(script.contains("exit 0"));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]
