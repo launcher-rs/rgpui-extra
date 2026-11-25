@@ -10,6 +10,8 @@
 //! - 所有网络函数是 blocking，调用方必须放到后台线程（可用 [`run_blocking`] 桥接 async）；
 //! - 网络层不认识具体程序，仓库、应用名、资产名全部由 [`Config`] 注入，
 //!   因此 launcher-rs 的其他程序可直接复用；
+//! - 支持 GitHub / Gitee / GitLab（含自托管）与兼容 GitHub API 的自定义服务，
+//!   由 [`Provider`] 决定 API 地址与 JSON 解析；
 //! - 需要 rgpui 对话框/进度视图时开启 `ui` feature（见 [`ui`] 模块）。
 
 use std::io::{Read as _, Write};
@@ -27,11 +29,82 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// 下载响应体上限 200MB，防止错配 URL 把超大内容读进内存。
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
+/// 代码托管平台。决定 Release API / 发布页地址与 JSON 解析方式。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Provider {
+    /// GitHub（默认）：`api.github.com` + `github.com`。
+    #[default]
+    GitHub,
+    /// Gitee：`gitee.com/api/v5`，Release JSON 与 GitHub 同构。
+    Gitee,
+    /// GitLab：支持 gitlab.com 与自托管实例，`base_url` 为实例根地址。
+    GitLab {
+        /// 形如 `https://gitlab.com` 或 `https://git.example.com`。
+        base_url: String,
+    },
+    /// 自定义：直接给出 API 与发布页地址，JSON 按 GitHub 结构解析。
+    /// Gitea / Forgejo 等兼容 GitHub API 的服务可用此变体。
+    Custom {
+        /// 返回最新 Release JSON 的完整地址。
+        api_url: String,
+        /// 浏览器中打开的发布页地址。
+        releases_page: String,
+    },
+}
+
+impl Provider {
+    /// Release API 地址。`repository` 形如 `owner/repo`。
+    pub fn api_url(&self, repository: &str) -> String {
+        match self {
+            Self::GitHub => {
+                format!("https://api.github.com/repos/{repository}/releases/latest")
+            }
+            Self::Gitee => {
+                format!("https://gitee.com/api/v5/repos/{repository}/releases/latest")
+            }
+            Self::GitLab { base_url } => format!(
+                "{}/api/v4/projects/{}/releases/permalink/latest",
+                base_url.trim_end_matches('/'),
+                encode_project_path(repository)
+            ),
+            Self::Custom { api_url, .. } => api_url.clone(),
+        }
+    }
+
+    /// 浏览器中打开的发布页地址。
+    pub fn releases_page(&self, repository: &str) -> String {
+        match self {
+            Self::GitHub => format!("https://github.com/{repository}/releases/latest"),
+            Self::Gitee => format!("https://gitee.com/{repository}/releases/latest"),
+            Self::GitLab { base_url } => {
+                format!("{}/{repository}/-/releases", base_url.trim_end_matches('/'))
+            }
+            Self::Custom { releases_page, .. } => releases_page.clone(),
+        }
+    }
+}
+
+/// GitLab API 要求项目路径整体做 percent-encode（`owner/repo` → `owner%2Frepo`）。
+fn encode_project_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// 一个应用的更新配置。所有应用相关信息都通过这里注入，组件本身不作硬编码。
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// GitHub 仓库，形如 `launcher-rs/rumark`。
+    /// 仓库路径，形如 `launcher-rs/rumark`。
     pub repository: String,
+    /// 代码托管平台；默认 GitHub。
+    pub provider: Provider,
     /// 应用名，用于拼默认资产名（如 `rumark-windows-x86_64.zip`）。
     pub app_name: String,
     /// 压缩包内可执行文件的名字（Windows 需带 `.exe`）。
@@ -57,6 +130,7 @@ impl Config {
         };
         Self {
             repository: repository.into(),
+            provider: Provider::default(),
             app_name,
             executable_name,
             user_agent: "launcher-updater/1.0".to_string(),
@@ -66,17 +140,14 @@ impl Config {
         }
     }
 
-    /// GitHub Releases API 的 latest 地址。
+    /// 当前平台 Release API 的 latest 地址。
     pub fn api_url(&self) -> String {
-        format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            self.repository
-        )
+        self.provider.api_url(&self.repository)
     }
 
-    /// 浏览器中打开的发布页地址。
+    /// 当前平台浏览器中打开的发布页地址。
     pub fn releases_page(&self) -> String {
-        format!("https://github.com/{}/releases/latest", self.repository)
+        self.provider.releases_page(&self.repository)
     }
 
     /// 当前平台对应的 Release 资产文件名。
@@ -230,9 +301,89 @@ fn blocking_client(config: &Config) -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-/// 解析 GitHub API 的 Release JSON。
+/// 解析 GitHub 风格 API 的 Release JSON（GitHub / Gitee / Gitea 等同构）。
 pub fn parse_release(body: &str) -> Result<ReleaseInfo> {
-    serde_json::from_str(body).context("解析 GitHub Release 响应失败")
+    serde_json::from_str(body).context("解析 Release 响应失败")
+}
+
+impl ReleaseInfo {
+    /// 按平台解析 Release JSON，统一成内部结构供 UI 与下载使用。
+    pub fn parse_for(provider: &Provider, body: &str) -> Result<Self> {
+        match provider {
+            Provider::GitLab { .. } => parse_gitlab_release(body),
+            Provider::Gitee => parse_gitee_release(body),
+            _ => parse_release(body),
+        }
+    }
+}
+
+/// Gitee 与 GitHub 结构基本同构；较老实例可能没有 `published_at`，用 `created_at` 兜底。
+fn parse_gitee_release(body: &str) -> Result<ReleaseInfo> {
+    let mut release = parse_release(body)?;
+    if release.published_at.is_empty() {
+        #[derive(Deserialize)]
+        struct CreatedAt {
+            #[serde(default)]
+            created_at: String,
+        }
+        if let Ok(extra) = serde_json::from_str::<CreatedAt>(body) {
+            release.published_at = extra.created_at;
+        }
+    }
+    Ok(release)
+}
+
+/// GitLab 的 Release JSON 与 GitHub 差异较大：描述字段叫 `description`、
+/// 资产藏在 `assets.links`、日期用 `released_at`，下载链接优先 `direct_asset_url`。
+fn parse_gitlab_release(body: &str) -> Result<ReleaseInfo> {
+    #[derive(Deserialize)]
+    struct Link {
+        name: String,
+        #[serde(default)]
+        direct_asset_url: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Assets {
+        #[serde(default)]
+        links: Vec<Link>,
+    }
+    #[derive(Deserialize)]
+    struct Raw {
+        tag_name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        released_at: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        assets: Assets,
+    }
+
+    let raw: Raw = serde_json::from_str(body).context("解析 GitLab Release 响应失败")?;
+    let first_nonempty = |a: Option<String>, b: Option<String>| {
+        a.filter(|s| !s.is_empty())
+            .or_else(|| b.filter(|s| !s.is_empty()))
+            .unwrap_or_default()
+    };
+    Ok(ReleaseInfo {
+        tag_name: raw.tag_name,
+        body: raw.description.unwrap_or_default(),
+        published_at: first_nonempty(raw.released_at, raw.created_at),
+        // GitLab 不提供资产大小，下载时按实际字节数与 200MB 上限校验。
+        assets: raw
+            .assets
+            .links
+            .into_iter()
+            .map(|link| ReleaseAsset {
+                name: link.name,
+                size: 0,
+                browser_download_url: first_nonempty(link.direct_asset_url, link.url),
+            })
+            .collect(),
+    })
 }
 
 /// 查询最新版本，依次尝试配置里的镜像，返回 (Release, 命中的镜像)。
@@ -249,7 +400,7 @@ pub fn fetch_latest_release(config: &Config) -> Result<(ReleaseInfo, String)> {
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.text())
         {
-            Ok(body) => match parse_release(&body) {
+            Ok(body) => match ReleaseInfo::parse_for(&config.provider, &body) {
                 Ok(release) => return Ok((release, mirror)),
                 Err(err) => attempts.push(format!("{url}: {err}")),
             },
@@ -620,6 +771,147 @@ mod tests {
         let release = parse_release(SAMPLE_RELEASE).unwrap();
         assert_eq!(release.tag_name, "v0.2.5");
         assert_eq!(release.assets[0].size, 123);
+    }
+
+    #[test]
+    fn provider_builds_api_and_release_page_urls() {
+        assert_eq!(
+            Provider::GitHub.api_url("launcher-rs/rumark"),
+            "https://api.github.com/repos/launcher-rs/rumark/releases/latest"
+        );
+        assert_eq!(
+            Provider::GitHub.releases_page("launcher-rs/rumark"),
+            "https://github.com/launcher-rs/rumark/releases/latest"
+        );
+
+        assert_eq!(
+            Provider::Gitee.api_url("owner/repo"),
+            "https://gitee.com/api/v5/repos/owner/repo/releases/latest"
+        );
+        assert_eq!(
+            Provider::Gitee.releases_page("owner/repo"),
+            "https://gitee.com/owner/repo/releases/latest"
+        );
+
+        let gitlab = Provider::GitLab {
+            base_url: "https://gitlab.com/".into(),
+        };
+        assert_eq!(
+            gitlab.api_url("owner/repo"),
+            "https://gitlab.com/api/v4/projects/owner%2Frepo/releases/permalink/latest"
+        );
+        assert_eq!(
+            gitlab.releases_page("owner/repo"),
+            "https://gitlab.com/owner/repo/-/releases"
+        );
+
+        let custom = Provider::Custom {
+            api_url: "https://git.example.com/api/latest".into(),
+            releases_page: "https://git.example.com/owner/repo/releases".into(),
+        };
+        assert_eq!(
+            custom.api_url("ignored"),
+            "https://git.example.com/api/latest"
+        );
+        assert_eq!(
+            custom.releases_page("ignored"),
+            "https://git.example.com/owner/repo/releases"
+        );
+    }
+
+    #[test]
+    fn encode_project_path_handles_nested_groups_and_specials() {
+        assert_eq!(encode_project_path("owner/repo"), "owner%2Frepo");
+        assert_eq!(encode_project_path("group/sub/repo"), "group%2Fsub%2Frepo");
+        assert_eq!(encode_project_path("a b+c"), "a%20b%2Bc");
+    }
+
+    #[test]
+    fn config_api_url_follows_provider() {
+        let mut config = config();
+        assert!(config.api_url().contains("api.github.com"));
+        config.provider = Provider::Gitee;
+        assert!(config.api_url().contains("gitee.com/api/v5"));
+        assert!(config.releases_page().contains("gitee.com"));
+    }
+
+    const GITEE_RELEASE: &str = r#"{
+        "tag_name": "v0.3.0",
+        "name": "v0.3.0",
+        "body": "Gitee 更新说明",
+        "created_at": "2026-11-20T10:00:00+08:00",
+        "assets": [
+            {"name": "demo-asset.zip", "browser_download_url": "https://gitee.com/owner/repo/releases/download/v0.3.0/demo-asset.zip", "size": 456}
+        ]
+    }"#;
+
+    #[test]
+    fn parses_gitee_release_with_created_at_fallback() {
+        let release = ReleaseInfo::parse_for(&Provider::Gitee, GITEE_RELEASE).unwrap();
+        assert_eq!(release.tag_name, "v0.3.0");
+        assert_eq!(release.body, "Gitee 更新说明");
+        // Gitee 较老实例没有 published_at，应回退到 created_at。
+        assert_eq!(release.published_at, "2026-11-20T10:00:00+08:00");
+        assert_eq!(release.assets[0].size, 456);
+        assert!(release.assets[0].browser_download_url.contains("gitee.com"));
+    }
+
+    const GITLAB_RELEASE: &str = r#"{
+        "tag_name": "v0.4.0",
+        "description": "GitLab release notes",
+        "released_at": "2026-11-22T08:00:00Z",
+        "created_at": "2026-11-21T08:00:00Z",
+        "assets": {
+            "count": 2,
+            "links": [
+                {
+                    "id": 1,
+                    "name": "demo-asset.zip",
+                    "url": "https://gitlab.com/owner/repo/-/releases/v0.4.0/downloads/demo-asset.zip",
+                    "direct_asset_url": "https://gitlab.com/owner/repo/-/releases/v0.4.0/downloads/demo-asset.zip?direct=1",
+                    "link_type": "other"
+                },
+                {"id": 2, "name": "docs", "url": "https://gitlab.com/owner/repo/-/blob/main/README.md"}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parses_gitlab_release_links_and_dates() {
+        let provider = Provider::GitLab {
+            base_url: "https://gitlab.com".into(),
+        };
+        let release = ReleaseInfo::parse_for(&provider, GITLAB_RELEASE).unwrap();
+        assert_eq!(release.tag_name, "v0.4.0");
+        assert_eq!(release.body, "GitLab release notes");
+        // released_at 优先于 created_at。
+        assert_eq!(release.published_at, "2026-11-22T08:00:00Z");
+        assert_eq!(release.assets.len(), 2);
+        assert_eq!(release.assets[0].name, "demo-asset.zip");
+        // direct_asset_url 优先于 url。
+        assert!(release.assets[0].browser_download_url.contains("direct=1"));
+        // GitLab 不提供资产大小。
+        assert_eq!(release.assets[0].size, 0);
+        // 没有 direct_asset_url 时回退到 url。
+        assert!(release.assets[1].browser_download_url.contains("README.md"));
+    }
+
+    #[test]
+    fn gitlab_release_falls_back_to_created_at_and_plain_url() {
+        let body = r#"{
+            "tag_name": "v1.0.0",
+            "created_at": "2026-01-01T00:00:00Z",
+            "assets": {"links": [{"name": "demo.zip", "url": "https://example.com/demo.zip"}]}
+        }"#;
+        let provider = Provider::GitLab {
+            base_url: "https://gitlab.com".into(),
+        };
+        let release = ReleaseInfo::parse_for(&provider, body).unwrap();
+        assert_eq!(release.published_at, "2026-01-01T00:00:00Z");
+        assert_eq!(
+            release.assets[0].browser_download_url,
+            "https://example.com/demo.zip"
+        );
     }
 
     #[test]
