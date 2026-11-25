@@ -131,6 +131,7 @@ while kill -0 {pid} 2>/dev/null; do\n\
   sleep 1\n\
 done\n\
 \n\
+chmod +x \"$NEW\" || exit 1\n\
 mv -f \"$NEW\" \"$EXE\" || exit 1\n\
 \"$EXE\"{args} >/dev/null 2>&1 &\n\
 exit 0\n",
