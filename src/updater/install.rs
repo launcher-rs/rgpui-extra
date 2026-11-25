@@ -54,7 +54,7 @@ pub fn build_windows_script(options: &InstallOptions) -> String {
     let args = options
         .restart_args
         .iter()
-        .map(|arg| format!("    {},", powershell_quote(arg)))
+        .map(|arg| format!("    {}", powershell_quote(arg)))
         .collect::<Vec<_>>()
         .join("\r\n");
     format!(
@@ -289,5 +289,101 @@ mod tests {
             ..options()
         };
         assert!(validate_staged(&opts).is_err());
+    }
+
+    /// 在 Windows 上真实运行 helper：覆盖中文目录中的程序，并验证中文参数能传给新进程。
+    #[cfg(windows)]
+    #[test]
+    fn windows_helper_replaces_and_restarts_with_unicode_file_arguments() {
+        use std::os::windows::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rgpui-updater-中文-{nonce}"));
+        let app_dir = root.join("应用程序");
+        let cache_dir = root.join("更新缓存");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let exe = app_dir.join("rumark.exe");
+        let staged = cache_dir.join("新版本.exe");
+        let marker = root.join("启动参数.txt");
+        let source = root.join("启动探针.rs");
+        let expected_argument = r"E:\桌面\Killer PDF\测试 文档.md";
+        std::fs::copy(
+            PathBuf::from(std::env::var_os("WINDIR").unwrap())
+                .join("System32")
+                .join("cmd.exe"),
+            &exe,
+        )
+        .unwrap();
+        let marker_literal = format!("{:?}", marker.to_string_lossy());
+        std::fs::write(
+            &source,
+            format!(
+                "fn main() {{{{\n    let args = std::env::args().skip(1).collect::<Vec<_>>();\n    std::fs::write({marker_literal}, args.join(\"\\n\")).unwrap();\n}}}}\n"
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(&source)
+            .arg("-o")
+            .arg(&staged)
+            .status()
+            .unwrap();
+        assert!(status.success(), "编译 Windows 启动探针失败");
+
+        // 让 helper 等待一个独立进程，模拟 Rumark 关闭其窗口后释放 exe。
+        let mut target = std::process::Command::new("ping")
+            .args(["127.0.0.1", "-n", "3"])
+            .creation_flags(0x08000000)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let options = InstallOptions {
+            current_exe: exe.clone(),
+            staged_exe: staged.clone(),
+            process_id: target.id(),
+            restart_args: vec![expected_argument.to_string()],
+        };
+        validate_staged(&options).unwrap();
+        let script = build_windows_script(&options);
+        let script_path = root.join("更新助手.ps1");
+        let mut script_bytes = vec![0xFF, 0xFE];
+        for code_unit in script.encode_utf16() {
+            script_bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        std::fs::write(&script_path, script_bytes).unwrap();
+        let mut helper = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let helper_status = helper.wait().unwrap();
+        let _ = target.wait();
+        assert!(helper_status.success(), "Windows 更新 helper 执行失败");
+        assert!(marker.exists(), "更新后的程序未能从中文目录启动");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected_argument);
+        assert!(!staged.exists(), "暂存文件应已替换到目标位置");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
