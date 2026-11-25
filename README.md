@@ -6,7 +6,7 @@ rgpui 生态的扩展组件库，按需启用 feature，不引入用不到的依
 
 | 组件 | Feature | 说明 |
 | --- | --- | --- |
-| `updater` | `updater` | GitHub Release 版本检测与分块下载，核心逻辑零 GUI 依赖 |
+| `updater` | `updater` | 多平台 Release 版本检测与分块下载，核心逻辑零 GUI 依赖 |
 
 ## 安装
 
@@ -40,7 +40,8 @@ let result = run_blocking(move || {
         return Ok(None);
     }
     let asset = check.asset.context("当前平台没有可用更新包")?;
-    let staged = download_and_stage(&config, &asset, &config_updates_dir, |progress| {
+    let version = check.remote.version_string();
+    let staged = download_and_stage(&config, &asset, &version, &config_updates_dir, |progress| {
         // 回调在后台线程执行；GUI 程序应在此只做线程安全的消息投递。
         println!("{}", progress.label());
     })?;
@@ -53,7 +54,8 @@ let result = run_blocking(move || {
 
 | 字段 | 说明 |
 | --- | --- |
-| `repository` | GitHub 仓库，如 `launcher-rs/rumark` |
+| `repository` | 仓库路径，如 `launcher-rs/rumark` |
+| `provider` | 发布平台，默认 `Provider::GitHub` |
 | `app_name` | 应用名，用于推导默认资产名 |
 | `executable_name` | 压缩包内可执行文件名称 |
 | `user_agent` | HTTP User-Agent |
@@ -63,9 +65,30 @@ let result = run_blocking(move || {
 
 默认资产名按平台推导：`{app}-windows-x86_64.zip`、`{app}-linux-x86_64.tar.gz`、`{app}-macos-aarch64.tar.gz`。
 
+### 发布平台
+
+`provider` 决定 Release API / 发布页地址与 JSON 解析方式，默认 GitHub：
+
+| 平台 | 写法 | API |
+| --- | --- | --- |
+| GitHub | `Provider::GitHub` | `api.github.com/repos/.../releases/latest` |
+| Gitee | `Provider::Gitee` | `gitee.com/api/v5/repos/.../releases/latest` |
+| GitLab.com / 自托管 | `Provider::GitLab { base_url }` | `<base>/api/v4/projects/<编码路径>/releases/permalink/latest` |
+| Gitea / Forgejo 等 | `Provider::Custom { api_url, releases_page }` | 自定义地址，JSON 按 GitHub 结构解析 |
+
+```rust
+use rgpui_extra::updater::{Config, Provider};
+
+let mut config = Config::new("owner/repo", "demo");
+config.provider = Provider::Gitee;
+// 自托管 GitLab：Provider::GitLab { base_url: "https://git.example.com".into() }
+```
+
+Gitee 的 Release JSON 与 GitHub 同构；GitLab 的 `assets.links` / `released_at` 会自动转换为统一结构，下载链接优先取 `direct_asset_url`。版本比较、镜像回退、暂存复用逻辑与平台无关。
+
 ### 镜像中转
 
-默认只直连 `api.github.com` 与 GitHub 资产域名。开启 `use_mirrors` 后，按以下顺序尝试并去重：
+默认只直连当前平台的 API 与资产域名（镜像主要面向 GitHub）。开启 `use_mirrors` 后，按以下顺序尝试并去重：
 
 1. `custom_mirrors` 中的自定义前缀
 2. 内置 `DEFAULT_MIRRORS`（`ghfast.top`、`ghproxy.net`）
@@ -82,7 +105,7 @@ let result = run_blocking(move || {
 
 ### 安全边界
 
-updater 只负责检测到下载落地，不自动替换正在运行的程序、不自动重启、不安装。替换时机由使用方自行决定。
+检测到下载落地默认不替换正在运行的程序、不自动重启。如需单文件替换 + 重启，可使用 `InstallOptions` / `spawn_install_helper`：它会在进程退出后用新 exe 覆盖旧 exe 并重启（Windows 上运行中的 exe 无法自覆盖，故需要独立 helper）。触发时机仍由使用方决定。
 
 ## 许可
 
