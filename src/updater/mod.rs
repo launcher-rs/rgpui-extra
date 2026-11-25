@@ -387,12 +387,64 @@ fn extract_payload(bytes: &[u8], asset_name: &str, exe_name: &str) -> Result<Vec
     bail!("无法识别的更新包格式：{asset_name}")
 }
 
+/// 一个已暂存、可直接安装的可执行文件及其版本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedUpdate {
+    /// 已下载并解压好的可执行文件完整路径。
+    pub path: PathBuf,
+    /// 该更新对应的版本号（规范化为 `major.minor.patch`）。
+    pub version: String,
+}
+
+/// 暂存可执行文件的文件名。
+pub fn staged_file_name(executable_name: &str) -> String {
+    format!("{executable_name}.new")
+}
+
+/// 与暂存文件同存的标记文件名，记录其对应版本，供后续复用判断。
+fn staged_version_file_name(executable_name: &str) -> String {
+    format!("{executable_name}.new.version")
+}
+
+/// 检查 `dest_dir` 下是否有对应 `version` 的已暂存更新。
+///
+/// 只有「可执行文件存在且非空」并且「版本标记文件存在且内容等于 version」时
+/// 才返回 `Some`。任一条件不满足（文件被删、内容为空、版本标记缺失或不匹配）
+/// 都视为无可用缓存，调用方据此决定是否重新下载。
+pub fn load_staged_update(
+    dest_dir: &Path,
+    executable_name: &str,
+    version: &str,
+) -> Option<StagedUpdate> {
+    // 先比对版本标记，避免无谓地读大文件的元数据。
+    let marker =
+        std::fs::read_to_string(dest_dir.join(staged_version_file_name(executable_name))).ok()?;
+    if marker.trim() != version {
+        return None;
+    }
+
+    let path = dest_dir.join(staged_file_name(executable_name));
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() == 0 {
+        return None;
+    }
+
+    Some(StagedUpdate {
+        path,
+        version: version.to_string(),
+    })
+}
+
 /// 下载资产、解压出可执行文件，写入 `dest_dir/<exe>.new` 并返回该路径。
+///
+/// 同时写入版本标记文件 `<exe>.new.version`，使下次检查更新时能识别这份
+/// 缓存对应的版本并直接复用，避免用户点「稍后」后被迫重新下载。
 /// `on_progress` 在后台线程被调用，调用方只做线程安全的数据投递（如 `mpsc::send`）。
 /// 必须在后台线程调用。
 pub fn download_and_stage<F>(
     config: &Config,
     asset: &ReleaseAsset,
+    version: &str,
     dest_dir: &Path,
     on_progress: F,
 ) -> Result<PathBuf>
@@ -440,10 +492,18 @@ where
     }
 
     std::fs::create_dir_all(dest_dir)?;
-    let staged = dest_dir.join(format!("{}.new", config.executable_name));
+    let staged = dest_dir.join(staged_file_name(&config.executable_name));
     let mut out = std::fs::File::create(&staged)?;
     out.write_all(&executable)?;
     out.flush()?;
+
+    // 版本标记与可执行文件一起落地：若这一步失败则整个下载失败，避免出现
+    // 「有 .new 却不知道是哪个版本」的缓存，防止下次误装旧版本。
+    let marker = dest_dir.join(staged_version_file_name(&config.executable_name));
+    let mut marker_out = std::fs::File::create(&marker)?;
+    marker_out.write_all(version.trim().as_bytes())?;
+    marker_out.flush()?;
+
     Ok(staged)
 }
 
@@ -577,5 +637,47 @@ mod tests {
         };
         assert_eq!(unknown.fraction(), None);
         assert_eq!(unknown.percent(), None);
+    }
+
+    #[test]
+    fn staged_file_name_uses_exe_suffix() {
+        assert_eq!(staged_file_name("rumark.exe"), "rumark.exe.new");
+    }
+
+    #[test]
+    fn load_staged_update_requires_matching_marker_and_nonempty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rgpui-extra-staged-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 没有任何文件 → 无缓存。
+        assert!(load_staged_update(&dir, "demo.exe", "0.2.4").is_none());
+
+        // 版本标记不匹配 → 无缓存（防止误装旧版本）。
+        std::fs::write(dir.join("demo.exe.new.version"), "0.2.3").unwrap();
+        std::fs::write(dir.join("demo.exe.new"), b"binary").unwrap();
+        assert!(load_staged_update(&dir, "demo.exe", "0.2.4").is_none());
+
+        // 版本匹配（容忍首尾空白）且文件非空 → 命中缓存。
+        std::fs::write(dir.join("demo.exe.new.version"), " 0.2.4\n").unwrap();
+        let staged = load_staged_update(&dir, "demo.exe", "0.2.4").unwrap();
+        assert_eq!(staged.version, "0.2.4");
+        assert_eq!(staged.path, dir.join("demo.exe.new"));
+
+        // 可执行文件为空 → 无缓存。
+        std::fs::write(dir.join("demo.exe.new"), b"").unwrap();
+        assert!(load_staged_update(&dir, "demo.exe", "0.2.4").is_none());
+
+        // 可执行文件缺失 → 无缓存。
+        std::fs::remove_file(dir.join("demo.exe.new")).unwrap();
+        assert!(load_staged_update(&dir, "demo.exe", "0.2.4").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
